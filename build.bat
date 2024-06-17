@@ -10,7 +10,6 @@ set flags=/nologo /Z7 /WX /W4 /wd4201 /wd4115 /wd4013 /wd4116 /wd4324 /std:c++20
 set debug_flags=/Od /MTd /DBUILD_DEBUG=1
 set release_flags=/O2 /MT /DBUILD_RELEASE=1
 set linker_flags=/opt:ref /incremental:no
-set libraries=user32.lib dxguid.lib dxgi.lib d3dcompiler.lib d3d12.lib
 
 rem ==========================================================================================
 rem BUILD
@@ -24,7 +23,13 @@ rem ============================================================================
 rem DEBUG
 rem ==========================================================================================
 
-cl ../hello_bindless.cpp /Fe:hello_bindless_debug.exe %flags% %debug_flags% /link %linker_flags% %libraries%
+echo]
+echo =========================
+echo       DEBUG BUILD
+echo =========================
+echo]
+
+cl ../hello_bindless.cpp /Fe:hello_bindless_debug.exe %flags% %debug_flags% /link %linker_flags%
 if %ERRORLEVEL% neq 0 goto bail
 
 robocopy . ..\run *_debug.exe *_debug.dll *_debug.pdb /S > NUL
@@ -33,7 +38,13 @@ rem ============================================================================
 rem RELEASE
 rem ==========================================================================================
 
-cl ../hello_bindless.cpp /Fe:hello_bindless_release.exe %flags% %release_flags% /link %linker_flags% %libraries%
+echo]
+echo =========================
+echo      RELEASE BUILD
+echo =========================
+echo]
+
+cl ../hello_bindless.cpp /Fe:hello_bindless_release.exe %flags% %release_flags% /link %linker_flags%
 if %ERRORLEVEL% neq 0 goto bail
 
 robocopy . ..\run *_release.exe *_release.dll *_release.pdb /S > NUL

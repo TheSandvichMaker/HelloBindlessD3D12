@@ -22,35 +22,37 @@
 #define CHECK_HR(hr) assert(SUCCEEDED(hr))
 #define COM_SAFE_RELEASE(obj) ((obj) ? (obj)->Release(), (obj) = nullptr, true : false)
 
-static constexpr size_t KiB(size_t num)
-{
-	return num << 10ull;
-}
-
-static constexpr size_t MiB(size_t num)
-{
-	return num << 20ull;
-}
-
-static constexpr size_t GiB(size_t num)
-{
-	return num << 30ull;
-}
-
+#define KiB(num) ((num) << 10ull)
+#define MiB(num) ((num) << 20ull)
+#define GiB(num) ((num) << 30ull)
 #define ArrayCount(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define ZeroStruct(to_zero) memset(to_zero, 0, sizeof(*(to_zero)))
 
-template <typename T>
-static void ZeroStruct(T *to_zero)
-{
-	memset(to_zero, 0, sizeof(*to_zero));
-}
+#define STRINGIFY__(x) #x
+#define STRINGIFY_(x)  STRINGIFY__(x)
+#define STRINGIFY(x)   STRINGIFY_(x)
 
 //------------------------------------------------------------------------
 // Window
 
 static LRESULT Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
 {
-	return DefWindowProcW(hwnd, message, w_param, l_param);
+	LRESULT result = 0;
+
+	switch (message)
+	{
+		case WM_DESTROY:
+		{
+			PostQuitMessage(0);
+		} break;
+
+		default:
+		{
+			result = DefWindowProcW(hwnd, message, w_param, l_param);
+		} break;
+	}
+
+	return result;
 }
 
 static HWND Win32_CreateWindow()
@@ -109,7 +111,7 @@ struct DXC_State
 	IDxcCompiler3 *compiler;
 };
 
-DXC_State g_dxc;
+static DXC_State g_dxc;
 
 void DXC_Init()
 {
@@ -188,7 +190,6 @@ static constexpr bool g_enable_gpu_based_validation = true;
 enum D3D12_RootParameters
 {
 	D3D12_RootParameter_32bit_constants,
-	D3D12_RootParameter_draw_cbv,
 	D3D12_RootParameter_pass_cbv,
 	D3D12_RootParameter_view_cbv,
 	D3D12_RootParameter_global_cbv,
@@ -342,7 +343,7 @@ struct D3D12_DescriptorAllocator
 	void Init(ID3D12Device *device, D3D12_DESCRIPTOR_HEAP_TYPE in_type, uint32_t in_capacity, bool shader_visible, const wchar_t *debug_name)
 	{
 		D3D12_DESCRIPTOR_HEAP_DESC desc = {
-			.Type           = type,
+			.Type           = in_type,
 			.NumDescriptors = in_capacity,
 			.Flags          = shader_visible ? D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE : D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
 		};
@@ -458,7 +459,7 @@ struct D3D12_State
 
 //------------------------------------------------------------------------
 
-D3D12_State g_d3d;
+static D3D12_State g_d3d;
 
 //------------------------------------------------------------------------
 
@@ -674,8 +675,8 @@ void D3D12_Init(HWND window)
 	//------------------------------------------------------------------------
 	// Initialize descriptor allocators
 
-	g_d3d.cbv_srv_uav.Init(g_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, true, L"CBV SRV UAV Heap");
-	g_d3d.rtv        .Init(g_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,         64,   true, L"RTV Heap");
+	g_d3d.cbv_srv_uav.Init(g_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 4096, true,  L"CBV SRV UAV Heap");
+	g_d3d.rtv        .Init(g_d3d.device, D3D12_DESCRIPTOR_HEAP_TYPE_RTV,         64,   false, L"RTV Heap");
 
 	//------------------------------------------------------------------------
 	// Create swap chain
@@ -746,6 +747,11 @@ void D3D12_BeginFrame()
 	}
 
 	//------------------------------------------------------------------------
+	// Clear frame upload arena
+
+	frame->upload_arena.Reset();
+
+	//------------------------------------------------------------------------
 	// Initialize command list
 
 	ID3D12CommandAllocator    *allocator = frame->command_allocator;
@@ -765,11 +771,24 @@ void D3D12_EndFrame()
 	D3D12_Frame *frame = D3D12_GetFrameState();
 
 	//------------------------------------------------------------------------
+	// Switch render target to present state
+
+	ID3D12GraphicsCommandList *list = frame->command_list;
+
+	{
+		D3D12_RESOURCE_BARRIER barrier;
+		if (D3D12_Transition(frame->backbuffer, &frame->backbuffer_state, D3D12_RESOURCE_STATE_PRESENT, &barrier))
+		{
+			list->ResourceBarrier(1, &barrier);
+		}
+	}
+
+	//------------------------------------------------------------------------
 	// Submit command list
 
-	frame->command_list->Close();
+	list->Close();
 
-	ID3D12CommandList *lists[] = { frame->command_list };
+	ID3D12CommandList *lists[] = { list };
 	g_d3d.queue->ExecuteCommandLists(1, lists);
 
 	//------------------------------------------------------------------------
@@ -822,7 +841,7 @@ struct D3D12_RootConstants
 
 static_assert(sizeof(D3D12_RootConstants) % 4 == 0, "Root constants have to be a multiple of 4 bytes");
 
-const char *g_shader_source = R"(
+const char g_shader_source[] = "#line " STRINGIFY(__LINE__) R"(
 
 //------------------------------------------------------------------------
 // Typesafe bindless resource handle
@@ -834,12 +853,12 @@ struct Resource
 
 	T Get()
 	{
-		ResourceDescriptorHeap[index];
+		return ResourceDescriptorHeap[index];
 	}
 
 	T GetNonUniform()
 	{
-		ResourceDescriptorHeap[NonUniformResourceIndex(index)];
+		return ResourceDescriptorHeap[NonUniformResourceIndex(index)];
 	}
 };
 
@@ -889,9 +908,12 @@ void MainVS(
 float4 MainPS(
 	in float4 in_position : SV_Position,
 	in float2 in_uv       : TEXCOORD,
-	in float4 in_color    : COLOR)
+	in float4 in_color    : COLOR) : SV_Target
 {
 	float4 color = in_color;
+
+	color *= root.alpha;
+
 	return color;
 }
 
@@ -908,8 +930,9 @@ ID3D12PipelineState *D3D12_CreatePSO()
 	if (!DXC_CompileShader(g_shader_source, sizeof(g_shader_source), L"MainVS", L"vs_6_6", &vs, &error))
 	{
 		const char *error_message = (char *)error->GetBufferPointer();
-		fprintf(stderr, "Failed to compile vertex shader:\n%s\n", error_message);
-		assert(!"Failed to compile vertex shader, see console output for details");
+		OutputDebugStringA("Failed to compile vertex shader:\n");
+		OutputDebugStringA(error_message);
+		assert(!"Failed to compile vertex shader, see debugger output for details");
 	}
 	COM_SAFE_RELEASE(error);
 
@@ -920,8 +943,9 @@ ID3D12PipelineState *D3D12_CreatePSO()
 	if (!DXC_CompileShader(g_shader_source, sizeof(g_shader_source), L"MainPS", L"ps_6_6", &ps, &error))
 	{
 		const char *error_message = (char *)error->GetBufferPointer();
-		fprintf(stderr, "Failed to compile pixel shader:\n%s\n", error_message);
-		assert(!"Failed to compile vertex shader, see console output for details");
+		OutputDebugStringA("Failed to compile pixel shader:\n");
+		OutputDebugStringA(error_message);
+		assert(!"Failed to compile pixel shader, see debugger output for details");
 	}
 	COM_SAFE_RELEASE(error);
 
@@ -948,16 +972,22 @@ ID3D12PipelineState *D3D12_CreatePSO()
 					.SrcBlendAlpha         = D3D12_BLEND_INV_DEST_ALPHA,
 					.DestBlendAlpha        = D3D12_BLEND_ONE,
 					.BlendOpAlpha          = D3D12_BLEND_OP_ADD,
-					.RenderTargetWriteMask = 0xFF,
+					.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL,
 				},
 			},
 		},
 		.SampleMask = D3D12_DEFAULT_SAMPLE_MASK,
+		.RasterizerState = {
+			.FillMode = D3D12_FILL_MODE_SOLID,
+			.CullMode = D3D12_CULL_MODE_NONE,
+			.FrontCounterClockwise = true,
+		},
 		.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
 		.NumRenderTargets = 1,
 		.RTVFormats = {
 			DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,
 		},
+		.SampleDesc = { .Count = 1, .Quality = 0 },
 	};
 
 	ID3D12PipelineState *pso;
@@ -1022,6 +1052,7 @@ void D3D12_InitScene(D3D12_Scene *scene)
 		D3D12_SHADER_RESOURCE_VIEW_DESC desc = {
 			.Format        = DXGI_FORMAT_UNKNOWN,
 			.ViewDimension = D3D12_SRV_DIMENSION_BUFFER,
+			.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
 			.Buffer = {
 				.FirstElement        = 0,
 				.NumElements         = 3,
@@ -1031,6 +1062,11 @@ void D3D12_InitScene(D3D12_Scene *scene)
 
 		g_d3d.device->CreateShaderResourceView(scene->vbuffer, &desc, scene->vbuffer_srv.cpu);
 	}
+
+	//------------------------------------------------------------------------
+	// Initialize triangle guys
+
+	scene->triangle_guy_count = 4;
 }
 
 //------------------------------------------------------------------------
@@ -1150,7 +1186,7 @@ void D3D12_Render(D3D12_Scene *scene)
 //------------------------------------------------------------------------
 // Main
 
-LARGE_INTEGER g_qpc_freq;
+static LARGE_INTEGER g_qpc_freq;
 
 static LARGE_INTEGER GetTime()
 {
@@ -1170,11 +1206,15 @@ static double TimeElapsed(LARGE_INTEGER start, LARGE_INTEGER end)
 	return (double)(end.QuadPart - start.QuadPart) / (double)g_qpc_freq.QuadPart;
 }
 
-D3D12_Scene g_scene;
+static D3D12_Scene g_scene;
 
 int main(int, char **)
 {
 	HWND window = Win32_CreateWindow();
+
+	//------------------------------------------------------------------------
+	
+	DXC_Init();
 
 	//------------------------------------------------------------------------
 
