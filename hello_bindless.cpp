@@ -1128,8 +1128,6 @@ struct D3D12_Scene
 	TriangleGuy triangle_guys[16];
 };
 
-//------------------------------------------------------------------------
-
 void D3D12_InitScene(D3D12_Scene *scene)
 {
 	//------------------------------------------------------------------------
@@ -1209,19 +1207,7 @@ void D3D12_InitScene(D3D12_Scene *scene)
 	{
 		scene->textures     [i] = D3D12_CreateTexture(g_d3d.device, 4, 4, L"Checkerboard", texture_pixels[i], frame->command_list, &frame->upload_arena);
 		scene->textures_srvs[i] = g_d3d.cbv_srv_uav.Allocate();
-
-		{
-			D3D12_SHADER_RESOURCE_VIEW_DESC desc = {
-				.Format        = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-				.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
-				.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
-				.Texture2D = {
-					.MipLevels = 1,
-				},
-			};
-
-			g_d3d.device->CreateShaderResourceView(scene->textures[i], &desc, scene->textures_srvs[i].cpu);
-		}
+		g_d3d.device->CreateShaderResourceView(scene->textures[i], nullptr, scene->textures_srvs[i].cpu);
 	}
 
 	//------------------------------------------------------------------------
@@ -1239,9 +1225,7 @@ void D3D12_InitScene(D3D12_Scene *scene)
 	scene->initialized = true;
 }
 
-//------------------------------------------------------------------------
-
-void D3D12_Update(D3D12_Scene *scene, double current_time)
+void D3D12_UpdateScene(D3D12_Scene *scene, double current_time)
 {
 	for (size_t i = 0; i < scene->triangle_guy_count; i++)
 	{
@@ -1381,12 +1365,7 @@ int main(int, char **)
 {
 	HWND window = Win32_CreateWindow();
 
-	//------------------------------------------------------------------------
-	
 	DXC_Init();
-
-	//------------------------------------------------------------------------
-
 	D3D12_Init(window);
 
 	//------------------------------------------------------------------------
@@ -1425,7 +1404,7 @@ int main(int, char **)
 			D3D12_InitScene(&g_scene);
 		}
 
-		D3D12_Update(&g_scene, current_time);
+		D3D12_UpdateScene(&g_scene, current_time);
 		D3D12_Render(&g_scene);
 
 		D3D12_EndFrame();
