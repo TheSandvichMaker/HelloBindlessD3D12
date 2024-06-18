@@ -1,3 +1,5 @@
+// See license at bottom of file
+
 #include <assert.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -35,7 +37,7 @@
 //------------------------------------------------------------------------
 // Window
 
-static LRESULT Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
+static LRESULT CALLBACK Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
 {
 	LRESULT result = 0;
 
@@ -202,7 +204,7 @@ static ID3D12Resource *D3D12_CreateUploadBuffer(
 	ID3D12Device  *device,
 	uint32_t       size,
 	const wchar_t *debug_name,
-	void          *initial_data      = nullptr,
+	const void    *initial_data      = nullptr,
 	uint32_t       initial_data_size = 0) 
 {
 	D3D12_HEAP_PROPERTIES heap_properties = {
@@ -226,7 +228,7 @@ static ID3D12Resource *D3D12_CreateUploadBuffer(
 		D3D12_HEAP_FLAG_NONE,
 		&desc,
 		D3D12_RESOURCE_STATE_COMMON,
-		NULL,
+		nullptr,
 		IID_PPV_ARGS(&result));
 
 	CHECK_HR(hr);
@@ -246,11 +248,33 @@ static ID3D12Resource *D3D12_CreateUploadBuffer(
 
 		memcpy(mapped, initial_data, initial_data_size);
 
-		D3D12_RANGE write_range = {
-			.Begin = 0,
-			.End   = initial_data_size,
-		};
-		result->Unmap(0, &write_range);
+		result->Unmap(0, nullptr);
+	}
+
+	return result;
+}
+
+//------------------------------------------------------------------------
+
+static bool D3D12_Transition(
+	ID3D12Resource         *resource,
+	D3D12_RESOURCE_STATES  *current_state,
+	D3D12_RESOURCE_STATES   desired_state,
+	D3D12_RESOURCE_BARRIER *barrier)
+{
+	bool result = false;
+
+	if (*current_state != desired_state)
+	{
+		barrier->Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier->Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier->Transition.pResource = resource;
+		barrier->Transition.Subresource = 0;
+		barrier->Transition.StateBefore = *current_state;
+		barrier->Transition.StateAfter  = desired_state;
+		*current_state = desired_state;
+
+		result = true;
 	}
 
 	return result;
@@ -320,6 +344,110 @@ struct D3D12_LinearAllocator
 		ZeroStruct(this);
 	}
 };
+
+//------------------------------------------------------------------------
+// Texture creation
+
+static ID3D12Resource *D3D12_CreateTexture(
+	ID3D12Device              *device,
+	uint32_t                   width,
+	uint32_t                   height,
+	const wchar_t             *debug_name,
+	const void                *initial_data = nullptr,
+	ID3D12GraphicsCommandList *command_list = nullptr,
+	D3D12_LinearAllocator     *allocator    = nullptr)
+{
+	D3D12_HEAP_PROPERTIES heap_properties = {
+		.Type = D3D12_HEAP_TYPE_DEFAULT,
+	};
+
+	D3D12_RESOURCE_DESC desc = {
+		.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+		.Width            = width,
+		.Height           = height,
+		.DepthOrArraySize = 1,
+		.MipLevels        = 1,
+		.Format           = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+		.SampleDesc       = { .Count = 1, .Quality = 0 },
+		.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+	};
+
+	ID3D12Resource *result;
+	HRESULT hr = device->CreateCommittedResource(
+		&heap_properties,
+		D3D12_HEAP_FLAG_NONE,
+		&desc,
+		D3D12_RESOURCE_STATE_COMMON,
+		nullptr,
+		IID_PPV_ARGS(&result));
+
+	CHECK_HR(hr);
+
+	result->SetName(debug_name);
+
+	if (initial_data)
+	{
+		assert(allocator    || !"If you want to provide the texture with initial data, we need an allocator with an upload heap");
+		assert(command_list || !"If you want to provide the texture with initial data, we need a command list to issue a copy on");
+
+		// Figure out the required layout of the texture
+		uint64_t dst_size;
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_layout;
+		device->GetCopyableFootprints(&desc, 0, 1, 0, &dst_layout, nullptr, nullptr, &dst_size);
+
+		// Create an upload heap allocation to serve as the copy source
+		D3D12_BufferAllocation dst_alloc = allocator->Allocate((uint32_t)dst_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+
+		size_t src_stride = sizeof(uint32_t)*width;
+		size_t dst_stride = dst_layout.Footprint.RowPitch;
+
+		// copy the texture data to the upload heap
+		char *src = (char *)initial_data;
+		char *dst = (char *)dst_alloc.cpu_base;
+
+		for (size_t y = 0; y < height; y++)
+		{
+			memcpy(dst, src, sizeof(uint32_t)*width);
+
+			src += src_stride;
+			dst += dst_stride;
+		}
+
+		// issue the copy to the texture on the command list
+		D3D12_TEXTURE_COPY_LOCATION src_loc = {
+			.pResource = dst_alloc.buffer,
+			.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+			.PlacedFootprint = {
+				.Offset    = dst_alloc.offset,
+				.Footprint = dst_layout.Footprint,
+			},
+		};
+
+		D3D12_TEXTURE_COPY_LOCATION dst_loc = {
+			.pResource        = result,
+			.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+			.SubresourceIndex = 0,
+		};
+
+		command_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
+
+		{
+			D3D12_RESOURCE_BARRIER barrier = {
+				.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+				.Transition = {
+					.pResource   = result,
+					.Subresource = 0,
+					.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST,
+					.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+				},
+			};
+
+			command_list->ResourceBarrier(1, &barrier);
+		}
+	}
+
+	return result;
+}
 
 //------------------------------------------------------------------------
 
@@ -395,31 +523,6 @@ struct D3D12_DescriptorAllocator
 		ZeroStruct(this);
 	}
 };
-
-//------------------------------------------------------------------------
-
-static bool D3D12_Transition(
-	ID3D12Resource         *resource,
-	D3D12_RESOURCE_STATES  *current_state,
-	D3D12_RESOURCE_STATES   desired_state,
-	D3D12_RESOURCE_BARRIER *barrier)
-{
-	bool result = false;
-
-	if (*current_state != desired_state)
-	{
-		barrier->Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barrier->Transition.pResource = resource;
-		barrier->Transition.Subresource = 0;
-		barrier->Transition.StateBefore = *current_state;
-		barrier->Transition.StateAfter  = desired_state;
-		*current_state = desired_state;
-
-		result = true;
-	}
-
-	return result;
-}
 
 //------------------------------------------------------------------------
 
@@ -642,13 +745,28 @@ void D3D12_Init(HWND window)
 			},
 		};
 
+		D3D12_STATIC_SAMPLER_DESC samplers[] = {
+			{ // s_linear
+				.Filter           = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
+				.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+				.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+				.AddressW         = D3D12_TEXTURE_ADDRESS_MODE_WRAP,
+				.MipLODBias       = 0.0f,
+				.MinLOD           = 0.0f,
+				.MaxLOD           = D3D12_FLOAT32_MAX,
+				.ShaderRegister   = 0,
+				.RegisterSpace    = 0,
+				.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL,
+			},
+		};
+
 		D3D12_VERSIONED_ROOT_SIGNATURE_DESC desc = {
 			.Version = D3D_ROOT_SIGNATURE_VERSION_1_1,
 			.Desc_1_1 = {
 				.NumParameters     = ArrayCount(parameters),
 				.pParameters       = parameters,
-				.NumStaticSamplers = 0,
-				.pStaticSamplers   = nullptr,
+				.NumStaticSamplers = ArrayCount(samplers),
+				.pStaticSamplers   = samplers,
 				.Flags             = D3D12_ROOT_SIGNATURE_FLAG_CBV_SRV_UAV_HEAP_DIRECTLY_INDEXED,
 			},
 		};
@@ -836,31 +954,12 @@ struct D3D12_PassConstants
 struct D3D12_RootConstants
 {
 	Vector2D offset;
-	float    alpha;
+	uint32_t texture_index;
 };
 
 static_assert(sizeof(D3D12_RootConstants) % 4 == 0, "Root constants have to be a multiple of 4 bytes");
 
 const char g_shader_source[] = "#line " STRINGIFY(__LINE__) R"(
-
-//------------------------------------------------------------------------
-// Typesafe bindless resource handle
-
-template <typename T>
-struct Resource
-{
-	uint index;
-
-	T Get()
-	{
-		return ResourceDescriptorHeap[index];
-	}
-
-	T GetNonUniform()
-	{
-		return ResourceDescriptorHeap[NonUniformResourceIndex(index)];
-	}
-};
 
 //------------------------------------------------------------------------
 // Shader inputs
@@ -874,17 +973,19 @@ struct Vertex
 
 struct PassConstants
 {
-	Resource< StructuredBuffer<Vertex> > vbuffer;
+	uint vbuffer_index;
 };
 
 struct RootConstants
 {
 	float2 offset;
-	float  alpha;
+	uint   texture_index;
 };
 
 ConstantBuffer<PassConstants> pass : register(b1);
 ConstantBuffer<RootConstants> root : register(b0);
+
+sampler s_nearest : register(s0);
 
 //------------------------------------------------------------------------
 // Vertex shader
@@ -895,7 +996,9 @@ void MainVS(
 	out float2 out_uv           : TEXCOORD,
 	out float4 out_color        : COLOR)
 {
-	Vertex vertex = pass.vbuffer.Get().Load(in_vertex_index);
+    StructuredBuffer<Vertex> vbuffer = ResourceDescriptorHeap[pass.vbuffer_index];
+
+	Vertex vertex = vbuffer.Load(in_vertex_index);
 
 	out_position = float4(vertex.position + root.offset, 0, 1);
 	out_uv       = vertex.uv;
@@ -910,9 +1013,11 @@ float4 MainPS(
 	in float2 in_uv       : TEXCOORD,
 	in float4 in_color    : COLOR) : SV_Target
 {
-	float4 color = in_color;
+	Texture2D texture = ResourceDescriptorHeap[root.texture_index];
 
-	color *= root.alpha;
+	float4 color = texture.SampleLevel(s_nearest, in_uv, 0);
+
+	color *= in_color;
 
 	return color;
 }
@@ -966,7 +1071,7 @@ ID3D12PipelineState *D3D12_CreatePSO()
 			.RenderTarget = {
 				{
 					.BlendEnable = true,
-					.SrcBlend              = D3D12_BLEND_ONE,
+					.SrcBlend              = D3D12_BLEND_SRC_ALPHA,
 					.DestBlend             = D3D12_BLEND_INV_SRC_ALPHA,
 					.BlendOp               = D3D12_BLEND_OP_ADD,
 					.SrcBlendAlpha         = D3D12_BLEND_INV_DEST_ALPHA,
@@ -1002,17 +1107,22 @@ ID3D12PipelineState *D3D12_CreatePSO()
 struct TriangleGuy
 {
 	Vector2D position;
-	float    alpha;
+	uint32_t texture;
 };
 
 struct D3D12_Scene
 {
+	bool initialized;
+
 	ID3D12PipelineState *pso;
 
 	ID3D12Resource *ibuffer;
 	ID3D12Resource *vbuffer;
 
 	D3D12_Descriptor vbuffer_srv;
+
+	ID3D12Resource  *textures     [4];
+	D3D12_Descriptor textures_srvs[4];
 
 	uint32_t    triangle_guy_count;
 	TriangleGuy triangle_guys[16];
@@ -1034,17 +1144,17 @@ void D3D12_InitScene(D3D12_Scene *scene)
 		0, 1, 2,
 	};
 
+	float aspect_ratio = (float)g_d3d.window_w / (float)g_d3d.window_h;
+	float triangle_width = 0.577f / aspect_ratio;
+
 	Vertex vertices[] = {
-		{ {  0.0f,  0.5f }, { 0.5f, 1.0f }, { 1, 0, 0, 1 } },
-		{ {  0.5f, -0.5f }, { 1.0f, 0.0f }, { 0, 1, 0, 1 } },
-		{ { -0.5f, -0.5f }, { 0.0f, 0.0f }, { 0, 0, 1, 1 } },
+		{ {            0.0f,  0.5f }, {  5.0f, 10.0f }, { 1, 1, 1, 1 } },
+		{ {  triangle_width, -0.5f }, { 10.0f,  0.0f }, { 1, 1, 1, 1 } },
+		{ { -triangle_width, -0.5f }, {  0.0f,  0.0f }, { 1, 1, 1, 1 } },
 	};
 
 	scene->ibuffer = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(indices),  L"Index Buffer",  indices,  sizeof(indices));
 	scene->vbuffer = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(vertices), L"Vertex Buffer", vertices, sizeof(vertices));
-
-	//------------------------------------------------------------------------
-	// Make vertex buffer SRV
 
 	scene->vbuffer_srv = g_d3d.cbv_srv_uav.Allocate();
 
@@ -1064,9 +1174,69 @@ void D3D12_InitScene(D3D12_Scene *scene)
 	}
 
 	//------------------------------------------------------------------------
+	// Make textures
+
+	D3D12_Frame *frame = D3D12_GetFrameState();
+
+	const uint32_t texture_pixels[][4*4] = {
+		{ // checkerboard
+			0xFF444444, 0xFF444444, 0xFFFFFFAA, 0xFFFFFFAA,
+			0xFF444444, 0xFF444444, 0xFFFFFFAA, 0xFFFFFFAA,
+			0xFFFFFFAA, 0xFFFFFFAA, 0xFF444444, 0xFF444444,
+			0xFFFFFFAA, 0xFFFFFFAA, 0xFF444444, 0xFF444444,
+		},
+		{ // shifting checkerboard
+			0xFF444444, 0xFF444444, 0xFFFFFFFF, 0xFFFFFFFF,
+			0xFFFFFFFF, 0xFF444444, 0xFF444444, 0xFFFFFFFF,
+			0xFFFFFFFF, 0xFFFFFFFF, 0xFF444444, 0xFF444444,
+			0xFF444444, 0xFFFFFFFF, 0xFFFFFFFF, 0xFF444444,
+		},
+		{ // partytown
+			0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFF00FF,
+			0xFFFF00FF, 0xFF0000FF, 0xFF00FF00, 0xFFFF0000,
+			0xFFFF0000, 0xFF00FF00, 0xFF0000FF, 0xFFFF00FF,
+			0xFFFF00FF, 0xFF0000FF, 0xFF00FF00, 0xFFFF0000,
+		},
+		{ // rainbow stripes
+			0xFFFF0000, 0xFFFF0000, 0xFFFF0000, 0xFFFF0000,
+			0xFFFFFF00, 0xFFFFFF00, 0xFFFFFF00, 0xFFFFFF00,
+			0xFF0000FF, 0xFF0000FF, 0xFF0000FF, 0xFF0000FF,
+			0xFFFF00FF, 0xFFFF00FF, 0xFFFF00FF, 0xFFFF00FF,
+		},
+	};
+
+	for (size_t i = 0; i < ArrayCount(texture_pixels); i++)
+	{
+		scene->textures     [i] = D3D12_CreateTexture(g_d3d.device, 4, 4, L"Checkerboard", texture_pixels[i], frame->command_list, &frame->upload_arena);
+		scene->textures_srvs[i] = g_d3d.cbv_srv_uav.Allocate();
+
+		{
+			D3D12_SHADER_RESOURCE_VIEW_DESC desc = {
+				.Format        = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+				.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D,
+				.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
+				.Texture2D = {
+					.MipLevels = 1,
+				},
+			};
+
+			g_d3d.device->CreateShaderResourceView(scene->textures[i], &desc, scene->textures_srvs[i].cpu);
+		}
+	}
+
+	//------------------------------------------------------------------------
 	// Initialize triangle guys
 
 	scene->triangle_guy_count = 4;
+
+	for (size_t i = 0; i < scene->triangle_guy_count; i++)
+	{
+		scene->triangle_guys[i].texture = 3 - (uint32_t)i;
+	}
+
+	//------------------------------------------------------------------------
+
+	scene->initialized = true;
 }
 
 //------------------------------------------------------------------------
@@ -1079,7 +1249,6 @@ void D3D12_Update(D3D12_Scene *scene, double current_time)
 		
 		guy->position.x = (float)(0.5 * sin(0.6 * (double)i + 1.25*current_time));
 		guy->position.y = (float)(0.3 * sin(0.4 * (double)i + 0.65*current_time));
-		guy->alpha      = 0.75f + 0.25f*(float)(0.6 * sin(0.8 * (double)i + 0.75*current_time));
 	}
 }
 
@@ -1151,10 +1320,10 @@ void D3D12_Render(D3D12_Scene *scene)
 	//------------------------------------------------------------------------
 	// Set pass constants
 
-	D3D12_BufferAllocation pass_alloc = frame->upload_arena.Allocate(sizeof(D3D12_PassConstants), 256);
+	D3D12_BufferAllocation pass_alloc = frame->upload_arena.Allocate(sizeof(D3D12_PassConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
 	D3D12_PassConstants *pass_constants = (D3D12_PassConstants *)pass_alloc.cpu_base;
-	pass_constants->vbuffer_srv = scene->vbuffer_srv.index;
+	pass_constants->vbuffer_srv = scene->vbuffer_srv.index; // <-- bindless vertex buffer!
 
 	list->SetGraphicsRootConstantBufferView(D3D12_RootParameter_pass_cbv, pass_alloc.gpu_base);
 
@@ -1169,8 +1338,8 @@ void D3D12_Render(D3D12_Scene *scene)
 		// Set root constants
 
 		D3D12_RootConstants root_constants = {
-			.offset = guy->position,
-			.alpha  = guy->alpha,
+			.offset        = guy->position,
+			.texture_index = scene->textures_srvs[guy->texture].index, // <-- bindless textures!
 		};
 
 		uint32_t uint_count = sizeof(root_constants) / sizeof(uint32_t);
@@ -1221,10 +1390,6 @@ int main(int, char **)
 	D3D12_Init(window);
 
 	//------------------------------------------------------------------------
-
-	D3D12_InitScene(&g_scene);
-
-	//------------------------------------------------------------------------
 	// Main loop
 
 	LARGE_INTEGER start_time = GetTime();
@@ -1253,10 +1418,58 @@ int main(int, char **)
 
 		double current_time = TimeElapsed(start_time, GetTime());
 
-		D3D12_Update(&g_scene, current_time);
-
 		D3D12_BeginFrame();
+
+		if (!g_scene.initialized)
+		{
+			D3D12_InitScene(&g_scene);
+		}
+
+		D3D12_Update(&g_scene, current_time);
 		D3D12_Render(&g_scene);
+
 		D3D12_EndFrame();
 	}
 }
+
+/*
+------------------------------------------------------------------------------
+This software is available under 2 licenses -- choose whichever you prefer.
+------------------------------------------------------------------------------
+ALTERNATIVE A - MIT License
+Copyright (c) 2024 Daniël Cornelisse
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this software and associated documentation files (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+------------------------------------------------------------------------------
+ALTERNATIVE B - Public Domain (www.unlicense.org)
+This is free and unencumbered software released into the public domain.
+Anyone is free to copy, modify, publish, use, compile, sell, or distribute this
+software, either in source code form or as a compiled binary, for any purpose,
+commercial or non-commercial, and by any means.
+In jurisdictions that recognize copyright laws, the author or authors of this
+software dedicate any and all copyright interest in the software to the public
+domain. We make this dedication for the benefit of the public at large and to
+the detriment of our heirs and successors. We intend this dedication to be an
+overt act of relinquishment in perpetuity of all present and future rights to
+this software under copyright law.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN
+ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION
+WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+------------------------------------------------------------------------------
+*/
