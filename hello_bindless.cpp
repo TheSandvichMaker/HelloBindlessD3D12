@@ -35,77 +35,6 @@
 #define STRINGIFY(x)   STRINGIFY_(x)
 
 //------------------------------------------------------------------------
-// Window
-
-static LRESULT CALLBACK Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
-{
-	LRESULT result = 0;
-
-	switch (message)
-	{
-		case WM_DESTROY:
-		{
-			PostQuitMessage(0);
-		} break;
-
-		default:
-		{
-			result = DefWindowProcW(hwnd, message, w_param, l_param);
-		} break;
-	}
-
-	return result;
-}
-
-static HWND Win32_CreateWindow()
-{
-	HWND result = NULL;
-
-	int desktop_w = GetSystemMetrics(SM_CXFULLSCREEN);
-	int desktop_h = GetSystemMetrics(SM_CYFULLSCREEN);
-
-	int w = 3*desktop_w / 4;
-	int h = 3*desktop_h / 4;
-
-	WNDCLASSEXW wclass = 
-	{
-		.cbSize        = sizeof(wclass),
-		.style         = CS_HREDRAW|CS_VREDRAW,
-		.lpfnWndProc   = Win32_WindowProc,
-		.hIcon         = LoadIconW(NULL, L"APPICON"),
-		.hCursor       = NULL, 
-		.lpszClassName = L"HelloBindlessD3D12",
-	};
-
-	if (!RegisterClassExW(&wclass))
-	{
-		assert(!"Failed to register window class");
-	}
-
-	RECT wrect = {
-		.left   = 0,
-		.top    = 0,
-		.right  = w,
-		.bottom = h,
-	};
-
-	AdjustWindowRect(&wrect, WS_OVERLAPPEDWINDOW, FALSE);
-
-	result = CreateWindowExW(0, L"HelloBindlessD3D12", L"Hello Bindless",
-							WS_OVERLAPPEDWINDOW,
-							64, 64,
-							wrect.right - wrect.left,
-							wrect.bottom - wrect.top,
-							NULL, NULL, NULL, NULL);
-
-	assert(result || !"Failed to create window");
-
-	ShowWindow(result, SW_SHOW);
-
-	return result;
-}
-
-//------------------------------------------------------------------------
 // DXC
 
 struct DXC_State
@@ -179,7 +108,6 @@ bool DXC_CompileShader(
 
 	return result;
 }
-
 
 //------------------------------------------------------------------------
 // D3D12
@@ -568,8 +496,6 @@ static D3D12_State g_d3d;
 
 void D3D12_Init(HWND window)
 {
-	(void)window;
-
 	HRESULT hr;
 
 	//------------------------------------------------------------------------
@@ -1126,6 +1052,8 @@ struct D3D12_Scene
 
 	uint32_t    triangle_guy_count;
 	TriangleGuy triangle_guys[16];
+
+	uint32_t    texture_index_offset;
 };
 
 void D3D12_InitScene(D3D12_Scene *scene)
@@ -1304,10 +1232,13 @@ void D3D12_Render(D3D12_Scene *scene)
 	//------------------------------------------------------------------------
 	// Set pass constants
 
-	D3D12_BufferAllocation pass_alloc = frame->upload_arena.Allocate(sizeof(D3D12_PassConstants), D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
+	D3D12_BufferAllocation pass_alloc = 
+		frame->upload_arena.Allocate(
+			sizeof(D3D12_PassConstants), 
+			D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
 	D3D12_PassConstants *pass_constants = (D3D12_PassConstants *)pass_alloc.cpu_base;
-	pass_constants->vbuffer_srv = scene->vbuffer_srv.index; // <-- bindless vertex buffer!
+	pass_constants->vbuffer_srv = scene->vbuffer_srv.index;
 
 	list->SetGraphicsRootConstantBufferView(D3D12_RootParameter_pass_cbv, pass_alloc.gpu_base);
 
@@ -1321,9 +1252,11 @@ void D3D12_Render(D3D12_Scene *scene)
 		//------------------------------------------------------------------------
 		// Set root constants
 
+		uint32_t texture_index = (guy->texture + scene->texture_index_offset) % 4;
+
 		D3D12_RootConstants root_constants = {
 			.offset        = guy->position,
-			.texture_index = scene->textures_srvs[guy->texture].index, // <-- bindless textures!
+			.texture_index = scene->textures_srvs[texture_index].index,
 		};
 
 		uint32_t uint_count = sizeof(root_constants) / sizeof(uint32_t);
@@ -1334,6 +1267,93 @@ void D3D12_Render(D3D12_Scene *scene)
 
 		list->DrawIndexedInstanced(3, 1, 0, 0, 0);
 	}
+}
+
+//------------------------------------------------------------------------
+// Window
+
+static LRESULT CALLBACK Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
+{
+	LRESULT result = 0;
+
+	D3D12_Scene *scene = (D3D12_Scene *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+
+	switch (message)
+	{
+		case WM_DESTROY:
+		{
+			PostQuitMessage(0);
+		} break;
+
+		case WM_KEYDOWN:
+		{
+			switch (w_param)
+			{
+				case VK_SPACE:
+				{
+					if (scene)
+					{
+						scene->texture_index_offset += 1;
+					}
+				} break;
+			}
+		} break;
+
+		default:
+		{
+			result = DefWindowProcW(hwnd, message, w_param, l_param);
+		} break;
+	}
+
+	return result;
+}
+
+static HWND Win32_CreateWindow()
+{
+	HWND result = NULL;
+
+	int desktop_w = GetSystemMetrics(SM_CXFULLSCREEN);
+	int desktop_h = GetSystemMetrics(SM_CYFULLSCREEN);
+
+	int w = 3*desktop_w / 4;
+	int h = 3*desktop_h / 4;
+
+	WNDCLASSEXW wclass = 
+	{
+		.cbSize        = sizeof(wclass),
+		.style         = CS_HREDRAW|CS_VREDRAW,
+		.lpfnWndProc   = Win32_WindowProc,
+		.hIcon         = LoadIconW(NULL, L"APPICON"),
+		.hCursor       = NULL, 
+		.lpszClassName = L"HelloBindlessD3D12",
+	};
+
+	if (!RegisterClassExW(&wclass))
+	{
+		assert(!"Failed to register window class");
+	}
+
+	RECT wrect = {
+		.left   = 0,
+		.top    = 0,
+		.right  = w,
+		.bottom = h,
+	};
+
+	AdjustWindowRect(&wrect, WS_OVERLAPPEDWINDOW, FALSE);
+
+	result = CreateWindowExW(0, L"HelloBindlessD3D12", L"Hello Bindless",
+							WS_OVERLAPPEDWINDOW,
+							64, 64,
+							wrect.right - wrect.left,
+							wrect.bottom - wrect.top,
+							NULL, NULL, NULL, NULL);
+
+	assert(result || !"Failed to create window");
+
+	ShowWindow(result, SW_SHOW);
+
+	return result;
 }
 
 //------------------------------------------------------------------------
@@ -1364,6 +1384,8 @@ static D3D12_Scene g_scene;
 int main(int, char **)
 {
 	HWND window = Win32_CreateWindow();
+	
+	SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)&g_scene);
 
 	DXC_Init();
 	D3D12_Init(window);
