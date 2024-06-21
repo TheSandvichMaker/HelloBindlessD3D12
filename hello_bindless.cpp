@@ -763,6 +763,11 @@ void D3D12_Init(HWND window)
 		g_d3d.window_w = client_rect.right;
 		g_d3d.window_h = client_rect.bottom;
 	}
+
+	//------------------------------------------------------------------------
+	// Disable Alt+Enter keybind
+
+	g_d3d.factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
 }
 
 //------------------------------------------------------------------------
