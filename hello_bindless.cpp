@@ -42,7 +42,7 @@ struct DXC_State
 	IDxcCompiler3 *compiler;
 };
 
-static DXC_State g_dxc;
+DXC_State g_dxc;
 
 void DXC_Init()
 {
@@ -128,7 +128,7 @@ enum D3D12_RootParameters
 
 //------------------------------------------------------------------------
 
-static ID3D12Resource *D3D12_CreateUploadBuffer(
+ID3D12Resource *D3D12_CreateUploadBuffer(
 	ID3D12Device  *device,
 	uint32_t       size,
 	const wchar_t *debug_name,
@@ -184,7 +184,7 @@ static ID3D12Resource *D3D12_CreateUploadBuffer(
 
 //------------------------------------------------------------------------
 
-static bool D3D12_Transition(
+bool D3D12_Transition(
 	ID3D12Resource         *resource,
 	D3D12_RESOURCE_STATES  *current_state,
 	D3D12_RESOURCE_STATES   desired_state,
@@ -276,7 +276,7 @@ struct D3D12_LinearAllocator
 //------------------------------------------------------------------------
 // Texture creation
 
-static ID3D12Resource *D3D12_CreateTexture(
+ID3D12Resource *D3D12_CreateTexture(
 	ID3D12Device              *device,
 	uint32_t                   width,
 	uint32_t                   height,
@@ -490,7 +490,7 @@ struct D3D12_State
 
 //------------------------------------------------------------------------
 
-static D3D12_State g_d3d;
+D3D12_State g_d3d;
 
 //------------------------------------------------------------------------
 
@@ -1277,7 +1277,7 @@ void D3D12_Render(D3D12_Scene *scene)
 //------------------------------------------------------------------------
 // Window
 
-static LRESULT CALLBACK Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
+LRESULT CALLBACK Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param, LPARAM l_param)
 {
 	LRESULT result = 0;
 
@@ -1313,7 +1313,7 @@ static LRESULT CALLBACK Win32_WindowProc(HWND hwnd, UINT message, WPARAM w_param
 	return result;
 }
 
-static HWND Win32_CreateWindow()
+HWND Win32_CreateWindow()
 {
 	HWND result = NULL;
 
@@ -1364,9 +1364,9 @@ static HWND Win32_CreateWindow()
 //------------------------------------------------------------------------
 // Main
 
-static LARGE_INTEGER g_qpc_freq;
+LARGE_INTEGER g_qpc_freq;
 
-static LARGE_INTEGER GetTime()
+LARGE_INTEGER GetTime()
 {
 	LARGE_INTEGER result;
 	QueryPerformanceCounter(&result);
@@ -1374,7 +1374,7 @@ static LARGE_INTEGER GetTime()
 	return result;
 }
 
-static double TimeElapsed(LARGE_INTEGER start, LARGE_INTEGER end)
+double TimeElapsed(LARGE_INTEGER start, LARGE_INTEGER end)
 {
 	if (!g_qpc_freq.QuadPart)
 	{
@@ -1384,7 +1384,7 @@ static double TimeElapsed(LARGE_INTEGER start, LARGE_INTEGER end)
 	return (double)(end.QuadPart - start.QuadPart) / (double)g_qpc_freq.QuadPart;
 }
 
-static D3D12_Scene g_scene;
+D3D12_Scene g_scene;
 
 int main(int, char **)
 {
