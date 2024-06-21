@@ -672,7 +672,7 @@ void D3D12_Init(HWND window)
 		};
 
 		D3D12_STATIC_SAMPLER_DESC samplers[] = {
-			{ // s_linear
+			{ // s_nearest
 				.Filter           = D3D12_FILTER_MIN_MAG_POINT_MIP_LINEAR,
 				.AddressU         = D3D12_TEXTURE_ADDRESS_MODE_WRAP,
 				.AddressV         = D3D12_TEXTURE_ADDRESS_MODE_WRAP,
