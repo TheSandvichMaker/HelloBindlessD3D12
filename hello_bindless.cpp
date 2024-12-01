@@ -22,7 +22,7 @@
 // Utilities
 
 #define CHECK_HR(hr) assert(SUCCEEDED(hr))
-#define COM_SAFE_RELEASE(obj) ((obj) ? (obj)->Release(), (obj) = nullptr, true : false)
+#define COM_SAFE_RELEASE(obj) ((obj) ? (obj)->Release(), (obj) = NULL, true : false)
 
 #define KiB(num) ((num) << 10ull)
 #define MiB(num) ((num) << 20ull)
@@ -33,6 +33,13 @@
 #define STRINGIFY__(x) #x
 #define STRINGIFY_(x)  STRINGIFY__(x)
 #define STRINGIFY(x)   STRINGIFY_(x)
+
+uintptr_t AlignUp(uintptr_t address, uintptr_t align)
+{
+
+    uintptr_t result = (address + (align-1)) & (-(intptr_t)align);
+    return result;
+}
 
 //------------------------------------------------------------------------
 // DXC
@@ -79,8 +86,8 @@ bool DXC_CompileShader(
 
 	HRESULT hr;
 
-	IDxcResult *compile_result = nullptr;
-	hr = g_dxc.compiler->Compile(&source_buffer, args, ArrayCount(args), nullptr, IID_PPV_ARGS(&compile_result));
+	IDxcResult *compile_result = NULL;
+	hr = g_dxc.compiler->Compile(&source_buffer, args, ArrayCount(args), NULL, IID_PPV_ARGS(&compile_result));
 
 	if (SUCCEEDED(hr))
 	{
@@ -91,7 +98,7 @@ bool DXC_CompileShader(
 		{
 			if (compile_result->HasOutput(DXC_OUT_OBJECT))
 			{
-				hr = compile_result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(result_blob), nullptr);
+				hr = compile_result->GetOutput(DXC_OUT_OBJECT, IID_PPV_ARGS(result_blob), NULL);
 				CHECK_HR(hr);
 
 				result = true;
@@ -101,7 +108,7 @@ bool DXC_CompileShader(
 		// even if we succeeded, we could have warnings (if I didn't pass WX above...)
 		if (compile_result->HasOutput(DXC_OUT_ERRORS))
 		{
-			hr = compile_result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(error_blob), nullptr);
+			hr = compile_result->GetOutput(DXC_OUT_ERRORS, IID_PPV_ARGS(error_blob), NULL);
 			CHECK_HR(hr);
 		}
 	}
@@ -128,11 +135,23 @@ enum D3D12_RootParameters
 
 //------------------------------------------------------------------------
 
+static void *D3D12_MapEntireBuffer(ID3D12Resource *resource)
+{
+	D3D12_RANGE range = {};
+
+	void *result;
+
+	HRESULT hr = resource->Map(0, &range, &result);
+	CHECK_HR(hr);
+
+	return result;
+}
+
 ID3D12Resource *D3D12_CreateUploadBuffer(
 	ID3D12Device  *device,
 	uint32_t       size,
 	const wchar_t *debug_name,
-	const void    *initial_data      = nullptr,
+	const void    *initial_data      = NULL,
 	uint32_t       initial_data_size = 0) 
 {
 	D3D12_HEAP_PROPERTIES heap_properties = {
@@ -156,7 +175,7 @@ ID3D12Resource *D3D12_CreateUploadBuffer(
 		D3D12_HEAP_FLAG_NONE,
 		&desc,
 		D3D12_RESOURCE_STATE_COMMON,
-		nullptr,
+		NULL,
 		IID_PPV_ARGS(&result));
 
 	CHECK_HR(hr);
@@ -167,16 +186,11 @@ ID3D12Resource *D3D12_CreateUploadBuffer(
 	{
 		assert(initial_data_size <= size || !"Your initial data is too big for this upload buffer!");
 
-		void *mapped;
-
-		D3D12_RANGE read_range = {};
-		hr = result->Map(0, &read_range, &mapped);
-
-		CHECK_HR(hr);
+		void *mapped = D3D12_MapEntireBuffer(result);
 
 		memcpy(mapped, initial_data, initial_data_size);
 
-		result->Unmap(0, nullptr);
+		result->Unmap(0, NULL);
 	}
 
 	return result;
@@ -267,115 +281,207 @@ struct D3D12_LinearAllocator
 
 	void Release()
 	{
-		buffer->Unmap(0, nullptr);
+		buffer->Unmap(0, NULL);
 		buffer->Release();
 		ZeroStruct(this);
 	}
 };
 
 //------------------------------------------------------------------------
-// Texture creation
+// Ring Buffer Allocator
 
-ID3D12Resource *D3D12_CreateTexture(
-	ID3D12Device              *device,
-	uint32_t                   width,
-	uint32_t                   height,
-	const wchar_t             *debug_name,
-	const void                *initial_data = nullptr,
-	ID3D12GraphicsCommandList *command_list = nullptr,
-	D3D12_LinearAllocator     *allocator    = nullptr)
+static constexpr uint32_t MAX_UPLOAD_SUBMISSIONS  = 16;
+static constexpr uint32_t UPLOAD_RING_BUFFER_SIZE = 64 * 1024 * 1024; // 64 MiB
+
+struct D3D12_UploadSubmission
 {
-	D3D12_HEAP_PROPERTIES heap_properties = {
-		.Type = D3D12_HEAP_TYPE_DEFAULT,
-	};
+	ID3D12CommandAllocator    *allocator;
+	ID3D12GraphicsCommandList *command_list;
+	uint64_t                   fence_value;
+	uint32_t                   offset;
+	uint32_t                   size;
+	uint64_t                   head;
+};
 
-	D3D12_RESOURCE_DESC desc = {
-		.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
-		.Width            = width,
-		.Height           = height,
-		.DepthOrArraySize = 1,
-		.MipLevels        = 1,
-		.Format           = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
-		.SampleDesc       = { .Count = 1, .Quality = 0 },
-		.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN,
-	};
+struct D3D12_UploadContext
+{
+	ID3D12Resource            *buffer;
+	ID3D12GraphicsCommandList *command_list;
+	uint32_t                   offset;
+	void                      *pointer;
+	D3D12_UploadSubmission    *submission;
+};
 
-	ID3D12Resource *result;
-	HRESULT hr = device->CreateCommittedResource(
-		&heap_properties,
-		D3D12_HEAP_FLAG_NONE,
-		&desc,
-		D3D12_RESOURCE_STATE_COMMON,
-		nullptr,
-		IID_PPV_ARGS(&result));
+struct D3D12_RingBufferAllocator
+{
+	ID3D12CommandQueue    *queue;
+	ID3D12Fence           *fence;
+	uint64_t               fence_value;
+	D3D12_UploadSubmission submissions[MAX_UPLOAD_SUBMISSIONS];
+	uint32_t               submission_tail;
+	uint32_t               submission_head;
+	ID3D12Resource        *buffer;
+	uint8_t               *buffer_base;
+	uint64_t               capacity;
+	uint64_t               mask;
+	uint64_t               tail;
+	uint64_t               head;
 
-	CHECK_HR(hr);
-
-	result->SetName(debug_name);
-
-	if (initial_data)
+	void Init(ID3D12Device *device)
 	{
-		assert(allocator    || !"If you want to provide the texture with initial data, we need an allocator with an upload heap");
-		assert(command_list || !"If you want to provide the texture with initial data, we need a command list to issue a copy on");
-
-		// Figure out the required layout of the texture
-		uint64_t dst_size;
-		D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_layout;
-		device->GetCopyableFootprints(&desc, 0, 1, 0, &dst_layout, nullptr, nullptr, &dst_size);
-
-		// Create an upload heap allocation to serve as the copy source
-		D3D12_BufferAllocation dst_alloc = allocator->Allocate((uint32_t)dst_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-
-		size_t src_stride = sizeof(uint32_t)*width;
-		size_t dst_stride = dst_layout.Footprint.RowPitch;
-
-		// copy the texture data to the upload heap
-		char *src = (char *)initial_data;
-		char *dst = (char *)dst_alloc.cpu_base;
-
-		for (size_t y = 0; y < height; y++)
+		HRESULT hr;
+		
 		{
-			memcpy(dst, src, sizeof(uint32_t)*width);
-
-			src += src_stride;
-			dst += dst_stride;
-		}
-
-		// issue the copy to the texture on the command list
-		D3D12_TEXTURE_COPY_LOCATION src_loc = {
-			.pResource = dst_alloc.buffer,
-			.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
-			.PlacedFootprint = {
-				.Offset    = dst_alloc.offset,
-				.Footprint = dst_layout.Footprint,
-			},
-		};
-
-		D3D12_TEXTURE_COPY_LOCATION dst_loc = {
-			.pResource        = result,
-			.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
-			.SubresourceIndex = 0,
-		};
-
-		command_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, nullptr);
-
-		{
-			D3D12_RESOURCE_BARRIER barrier = {
-				.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
-				.Transition = {
-					.pResource   = result,
-					.Subresource = 0,
-					.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST,
-					.StateAfter  = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
-				},
+			D3D12_COMMAND_QUEUE_DESC desc = {
+				.Type = D3D12_COMMAND_LIST_TYPE_COPY,
 			};
 
-			command_list->ResourceBarrier(1, &barrier);
+			hr = device->CreateCommandQueue(&desc, IID_PPV_ARGS(&queue));
+			CHECK_HR(hr);
 		}
+
+		for (size_t i = 0; i < ArrayCount(submissions); i++)
+		{
+			D3D12_UploadSubmission *submission = &submissions[i];
+
+			hr = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_COPY, IID_PPV_ARGS(&submission->allocator));
+			CHECK_HR(hr);
+
+			hr = device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_COPY, submission->allocator, NULL, IID_PPV_ARGS(&submission->command_list));
+			CHECK_HR(hr);
+
+			submission->command_list->Close();
+		}
+
+		hr = device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence));
+		CHECK_HR(hr);
+		
+		buffer      = D3D12_CreateUploadBuffer(device, UPLOAD_RING_BUFFER_SIZE, L"Ring Buffer Upload Buffer");
+		buffer_base = (uint8_t *)D3D12_MapEntireBuffer(buffer);
+
+		capacity = UPLOAD_RING_BUFFER_SIZE;
+		mask     = UPLOAD_RING_BUFFER_SIZE-1;
 	}
 
-	return result;
-}
+	bool RetireOneSubmission(bool wait_if_needed)
+	{
+		uint64_t retired_index = submission_tail % ArrayCount(submissions);
+		D3D12_UploadSubmission *submission = &submissions[retired_index];
+
+		uint64_t current_fence_value = fence->GetCompletedValue();
+
+		if (current_fence_value < fence_value)
+		{
+			if (!wait_if_needed)
+			{
+				return false;
+			}
+
+			fence->SetEventOnCompletion(submission->fence_value, NULL);
+		}
+
+		submission_tail += 1;
+		tail             = submission->head;
+
+		return true;
+	}
+
+	D3D12_UploadContext BeginUpload(uint64_t size, uint64_t align)
+	{
+		assert(size <= capacity);
+
+		uint32_t try_count = 0;
+
+		D3D12_UploadSubmission *submission = NULL;
+		while (!submission)
+		{
+			assert(try_count < ArrayCount(submissions));
+
+			uint64_t submissions_used      = submission_head - submission_tail;
+			uint64_t submissions_available = ArrayCount(submissions) - submissions_used;
+
+			if (submissions_available > 0)
+			{
+				uint64_t aligned_head = AlignUp(head, align);
+
+				uint64_t offset_start = (aligned_head           ) & mask;
+				uint64_t offset_end   = (aligned_head + size - 1) & mask;
+
+				if (offset_start >= offset_end)
+				{
+					aligned_head = AlignUp(head, capacity);
+
+					offset_start = (aligned_head           ) & mask;
+					offset_end   = (aligned_head + size - 1) & mask;
+				}
+
+				if (tail <= aligned_head)
+				{
+					uint64_t capacity_used      = aligned_head - tail;
+					uint64_t capacity_available = capacity - capacity_used;
+
+					if (capacity_available >= size)
+					{
+						uint64_t submission_index = submission_head % ArrayCount(submissions);
+						submission = &submissions[submission_index];
+						submission->offset = (uint32_t)offset_start;
+						submission->size   = (uint32_t)size;
+						submission->head   = aligned_head + submission->size;
+
+						submission_head += 1;
+						head             = submission->head;
+					}
+				}
+			}
+
+			if (!submission)
+			{
+				assert(submissions_used > 0);
+				RetireOneSubmission(true);
+			}
+
+			try_count += 1;
+		}
+
+		assert(submission);
+
+		submission->allocator   ->Reset();
+		submission->command_list->Reset(submission->allocator, NULL);
+
+		D3D12_UploadContext ctx = {
+			.buffer       = buffer,
+			.command_list = submission->command_list,
+			.offset       = submission->offset,
+			.pointer      = buffer_base + submission->offset,
+			.submission   = submission,
+		};
+
+		return ctx;
+	}
+
+	uint64_t EndUpload(const D3D12_UploadContext &ctx)
+	{
+		D3D12_UploadSubmission *submission = ctx.submission;
+
+		uint64_t upload_fence_value = ++fence_value;
+		submission->command_list->Close();
+
+		queue->ExecuteCommandLists(1, (ID3D12CommandList **)&submission->command_list);
+		queue->Signal(fence, upload_fence_value);
+
+		return upload_fence_value;
+	}
+
+	void Flush()
+	{
+		uint64_t current_fence_value = fence->GetCompletedValue();
+
+		if (current_fence_value < fence_value)
+		{
+			fence->SetEventOnCompletion(fence_value, NULL);
+		}
+	}
+};
 
 //------------------------------------------------------------------------
 
@@ -480,6 +586,8 @@ struct D3D12_State
 
 	D3D12_DescriptorAllocator cbv_srv_uav;
 	D3D12_DescriptorAllocator rtv;
+
+	D3D12_RingBufferAllocator upload_allocator;
 
 	IDXGISwapChain1 *swap_chain;
 	int window_w;
@@ -633,6 +741,11 @@ void D3D12_Init(HWND window)
 	}
 
 	//------------------------------------------------------------------------
+	// Initialize upload ring buffer allocator
+
+	g_d3d.upload_allocator.Init(g_d3d.device);
+
+	//------------------------------------------------------------------------
 	// Create bindless root signature
 
 	{
@@ -697,9 +810,9 @@ void D3D12_Init(HWND window)
 			},
 		};
 
-		ID3DBlob *serialized_desc = nullptr;
+		ID3DBlob *serialized_desc = NULL;
 
-		hr = D3D12SerializeVersionedRootSignature(&desc, &serialized_desc, nullptr);
+		hr = D3D12SerializeVersionedRootSignature(&desc, &serialized_desc, NULL);
 		CHECK_HR(hr);
 
 		hr = g_d3d.device->CreateRootSignature(0, serialized_desc->GetBufferPointer(), serialized_desc->GetBufferSize(), IID_PPV_ARGS(&g_d3d.rs_bindless));
@@ -735,7 +848,7 @@ void D3D12_Init(HWND window)
 			.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD,
 		};
 
-		hr = g_d3d.factory->CreateSwapChainForHwnd(g_d3d.queue, window, &desc, nullptr, nullptr, &g_d3d.swap_chain);
+		hr = g_d3d.factory->CreateSwapChainForHwnd(g_d3d.queue, window, &desc, NULL, NULL, &g_d3d.swap_chain);
 		CHECK_HR(hr);
 
 		for (uint32_t i = 0; i < g_frame_latency; i++)
@@ -771,6 +884,108 @@ void D3D12_Init(HWND window)
 }
 
 //------------------------------------------------------------------------
+// Texture creation
+
+ID3D12Resource *D3D12_CreateTexture(
+	ID3D12Device              *device,
+	uint32_t                   width,
+	uint32_t                   height,
+	const wchar_t             *debug_name,
+	const void                *initial_data = NULL)
+{
+	D3D12_HEAP_PROPERTIES heap_properties = {
+		.Type = D3D12_HEAP_TYPE_DEFAULT,
+	};
+
+	D3D12_RESOURCE_DESC desc = {
+		.Dimension        = D3D12_RESOURCE_DIMENSION_TEXTURE2D,
+		.Width            = width,
+		.Height           = height,
+		.DepthOrArraySize = 1,
+		.MipLevels        = 1,
+		.Format           = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB,
+		.SampleDesc       = { .Count = 1, .Quality = 0 },
+		.Layout           = D3D12_TEXTURE_LAYOUT_UNKNOWN,
+	};
+
+	ID3D12Resource *result;
+	HRESULT hr = device->CreateCommittedResource(
+		&heap_properties,
+		D3D12_HEAP_FLAG_NONE,
+		&desc,
+		D3D12_RESOURCE_STATE_COMMON,
+		NULL,
+		IID_PPV_ARGS(&result));
+
+	CHECK_HR(hr);
+
+	result->SetName(debug_name);
+
+	if (initial_data)
+	{
+		D3D12_RingBufferAllocator *allocator = &g_d3d.upload_allocator;
+
+		// Figure out the required layout of the texture
+		uint64_t dst_size;
+		D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_layout;
+		device->GetCopyableFootprints(&desc, 0, 1, 0, &dst_layout, NULL, NULL, &dst_size);
+
+		D3D12_UploadContext upload_ctx = allocator->BeginUpload(dst_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+
+		size_t src_stride = sizeof(uint32_t)*width;
+		size_t dst_stride = dst_layout.Footprint.RowPitch;
+
+		// copy the texture data to the upload heap
+		char *src = (char *)initial_data;
+		char *dst = (char *)upload_ctx.pointer;
+
+		for (size_t y = 0; y < height; y++)
+		{
+			memcpy(dst, src, sizeof(uint32_t)*width);
+
+			src += src_stride;
+			dst += dst_stride;
+		}
+
+		// issue the copy to the texture on the command list
+		D3D12_TEXTURE_COPY_LOCATION src_loc = {
+			.pResource = upload_ctx.buffer,
+			.Type      = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
+			.PlacedFootprint = {
+				.Offset    = upload_ctx.offset,
+				.Footprint = dst_layout.Footprint,
+			},
+		};
+
+		D3D12_TEXTURE_COPY_LOCATION dst_loc = {
+			.pResource        = result,
+			.Type             = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+			.SubresourceIndex = 0,
+		};
+
+		upload_ctx.command_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, NULL);
+
+		{
+			D3D12_RESOURCE_BARRIER barrier = {
+				.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+				.Transition = {
+					.pResource   = result,
+					.Subresource = 0,
+					.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST,
+					.StateAfter  = D3D12_RESOURCE_STATE_COMMON,
+				},
+			};
+
+			upload_ctx.command_list->ResourceBarrier(1, &barrier);
+		}
+
+		allocator->EndUpload(upload_ctx);
+	}
+
+	return result;
+}
+
+//------------------------------------------------------------------------
 
 D3D12_Frame *D3D12_GetFrameState()
 {
@@ -791,8 +1006,8 @@ void D3D12_BeginFrame()
 
 	if (completed < frame->fence_value)
 	{
-		// NOTE: If you pass nullptr for the event, this call will simply block until the fence value is reached, which is exactly what we want. So we don't even need to make an event!
-		g_d3d.fence->SetEventOnCompletion(frame->fence_value, nullptr);
+		// NOTE: If you pass NULL for the event, this call will simply block until the fence value is reached, which is exactly what we want. So we don't even need to make an event!
+		g_d3d.fence->SetEventOnCompletion(frame->fence_value, NULL);
 	}
 
 	//------------------------------------------------------------------------
@@ -807,7 +1022,7 @@ void D3D12_BeginFrame()
 	ID3D12GraphicsCommandList *list      = frame->command_list;
 
 	allocator->Reset();
-	list     ->Reset(allocator, nullptr);
+	list     ->Reset(allocator, NULL);
 
 	list->SetDescriptorHeaps      (1, &g_d3d.cbv_srv_uav.heap);
 	list->SetGraphicsRootSignature(g_d3d.rs_bindless);
@@ -957,12 +1172,12 @@ float4 MainPS(
 
 ID3D12PipelineState *D3D12_CreatePSO()
 {
-	IDxcBlob *error = nullptr;
+	IDxcBlob *error = NULL;
 
 	//------------------------------------------------------------------------
 	// Compile vertex shader
 
-	IDxcBlob *vs = nullptr;
+	IDxcBlob *vs = NULL;
 	if (!DXC_CompileShader(g_shader_source, sizeof(g_shader_source), L"MainVS", L"vs_6_6", &vs, &error))
 	{
 		const char *error_message = (char *)error->GetBufferPointer();
@@ -975,7 +1190,7 @@ ID3D12PipelineState *D3D12_CreatePSO()
 	//------------------------------------------------------------------------
 	// Compile pixel shader
 
-	IDxcBlob *ps = nullptr;
+	IDxcBlob *ps = NULL;
 	if (!DXC_CompileShader(g_shader_source, sizeof(g_shader_source), L"MainPS", L"ps_6_6", &ps, &error))
 	{
 		const char *error_message = (char *)error->GetBufferPointer();
@@ -1055,8 +1270,8 @@ struct D3D12_Scene
 	ID3D12Resource  *textures     [4];
 	D3D12_Descriptor textures_srvs[4];
 
-	uint32_t    triangle_guy_count;
-	TriangleGuy triangle_guys[16];
+	uint32_t     triangle_guy_count;
+	TriangleGuy *triangle_guys;
 
 	uint32_t    texture_index_offset;
 };
@@ -1107,8 +1322,6 @@ void D3D12_InitScene(D3D12_Scene *scene)
 	//------------------------------------------------------------------------
 	// Make textures
 
-	D3D12_Frame *frame = D3D12_GetFrameState();
-
 	const uint32_t texture_pixels[][4*4] = {
 		{ // checkerboard
 			0xFF444444, 0xFF444444, 0xFFFFFFAA, 0xFFFFFFAA,
@@ -1138,19 +1351,20 @@ void D3D12_InitScene(D3D12_Scene *scene)
 
 	for (size_t i = 0; i < ArrayCount(texture_pixels); i++)
 	{
-		scene->textures     [i] = D3D12_CreateTexture(g_d3d.device, 4, 4, L"Checkerboard", texture_pixels[i], frame->command_list, &frame->upload_arena);
+		scene->textures     [i] = D3D12_CreateTexture(g_d3d.device, 4, 4, L"Checkerboard", texture_pixels[i]);
 		scene->textures_srvs[i] = g_d3d.cbv_srv_uav.Allocate();
-		g_d3d.device->CreateShaderResourceView(scene->textures[i], nullptr, scene->textures_srvs[i].cpu);
+		g_d3d.device->CreateShaderResourceView(scene->textures[i], NULL, scene->textures_srvs[i].cpu);
 	}
 
 	//------------------------------------------------------------------------
 	// Initialize triangle guys
 
-	scene->triangle_guy_count = 4;
+	scene->triangle_guy_count = 1024;
+	scene->triangle_guys      = new TriangleGuy[scene->triangle_guy_count]{};
 
 	for (size_t i = 0; i < scene->triangle_guy_count; i++)
 	{
-		scene->triangle_guys[i].texture = 3 - (uint32_t)i;
+		scene->triangle_guys[i].texture = (uint32_t)(i % 4);
 	}
 
 	//------------------------------------------------------------------------
@@ -1189,10 +1403,10 @@ void D3D12_Render(D3D12_Scene *scene)
 		}
 	}
 
-	list->OMSetRenderTargets(1, &frame->rtv.cpu, false, nullptr);
+	list->OMSetRenderTargets(1, &frame->rtv.cpu, false, NULL);
 
 	float clear_color[4] = { 0.2f, 0.3f, 0.2f, 1.0f };
-	list->ClearRenderTargetView(frame->rtv.cpu, clear_color, 0, nullptr);
+	list->ClearRenderTargetView(frame->rtv.cpu, clear_color, 0, NULL);
 
 	//------------------------------------------------------------------------
 	// Input Assembler
@@ -1237,8 +1451,7 @@ void D3D12_Render(D3D12_Scene *scene)
 	//------------------------------------------------------------------------
 	// Set pass constants
 
-	D3D12_BufferAllocation pass_alloc = 
-		frame->upload_arena.Allocate(
+	D3D12_BufferAllocation pass_alloc = frame->upload_arena.Allocate(
 			sizeof(D3D12_PassConstants), 
 			D3D12_CONSTANT_BUFFER_DATA_PLACEMENT_ALIGNMENT);
 
