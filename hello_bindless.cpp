@@ -187,7 +187,11 @@ bool DXC_CompileShader(
 // D3D12
 
 static constexpr int  g_frame_latency = 3;
+#if BUILD_DEBUG
+static constexpr bool g_enable_gpu_based_validation = true;
+#else
 static constexpr bool g_enable_gpu_based_validation = false;
+#endif
 
 //------------------------------------------------------------------------
 
@@ -355,7 +359,7 @@ struct D3D12_UploadContext
 	}
 };
 
-struct D3D12_RingBufferAllocator
+struct D3D12_RingBufferUploader
 {
 	ID3D12CommandQueue    *queue;
 	ID3D12Fence           *fence;
@@ -657,7 +661,7 @@ struct D3D12_State
 	D3D12_DescriptorAllocator cbv_srv_uav;
 	D3D12_DescriptorAllocator rtv;
 
-	D3D12_RingBufferAllocator upload_allocator;
+	D3D12_RingBufferUploader uploader;
 
 	IDXGISwapChain1 *swap_chain;
 	int window_w;
@@ -813,7 +817,7 @@ void D3D12_Init(HWND window)
 	//------------------------------------------------------------------------
 	// Initialize upload ring buffer allocator
 
-	g_d3d.upload_allocator.Init(g_d3d.device);
+	g_d3d.uploader.Init(g_d3d.device);
 
 	//------------------------------------------------------------------------
 	// Create bindless root signature
@@ -1013,7 +1017,7 @@ ID3D12Resource *D3D12_CreateBuffer(
 	{
 		assert(initial_data_size <= size || !"Your initial data is too big for this buffer!");
 
-		D3D12_RingBufferAllocator *uploader = &g_d3d.upload_allocator;
+		D3D12_RingBufferUploader *uploader = &g_d3d.uploader;
 
 		D3D12_UploadContext upload_ctx = uploader->BeginUpload(initial_data_size, 256);
 		{
@@ -1065,14 +1069,14 @@ ID3D12Resource *D3D12_CreateTexture(
 
 	if (initial_data)
 	{
-		D3D12_RingBufferAllocator *allocator = &g_d3d.upload_allocator;
+		D3D12_RingBufferUploader *uploader = &g_d3d.uploader;
 
 		// Figure out the required layout of the texture
 		uint64_t dst_size;
 		D3D12_PLACED_SUBRESOURCE_FOOTPRINT dst_layout;
 		device->GetCopyableFootprints(&desc, 0, 1, 0, &dst_layout, NULL, NULL, &dst_size);
 
-		D3D12_UploadContext upload_ctx = allocator->BeginUpload(dst_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
+		D3D12_UploadContext upload_ctx = uploader->BeginUpload(dst_size, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
 
 		size_t src_stride = sizeof(uint32_t)*width;
 		size_t dst_stride = dst_layout.Footprint.RowPitch;
@@ -1121,7 +1125,7 @@ ID3D12Resource *D3D12_CreateTexture(
 			upload_ctx.command_list->ResourceBarrier(1, &barrier);
 		}
 
-		allocator->EndUpload(upload_ctx);
+		uploader->EndUpload(upload_ctx);
 	}
 
 	return result;
@@ -1518,13 +1522,8 @@ void D3D12_InitScene(D3D12_Scene *scene)
 		{ { -triangle_width, -0.5f }, {  0.0f,  0.0f }, { 1, 1, 1, 1 } },
 	};
 
-#if 0
-	scene->ibuffer = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(indices),  L"Index Buffer",  indices,  sizeof(indices));
-	scene->vbuffer = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(vertices), L"Vertex Buffer", vertices, sizeof(vertices));
-#else
 	scene->ibuffer = D3D12_CreateBuffer(g_d3d.device, sizeof(indices),  L"Index Buffer",  indices,  sizeof(indices));
 	scene->vbuffer = D3D12_CreateBuffer(g_d3d.device, sizeof(vertices), L"Vertex Buffer", vertices, sizeof(vertices));
-#endif
 
 	scene->vbuffer_srv = g_d3d.cbv_srv_uav.Allocate();
 
