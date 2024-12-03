@@ -34,12 +34,79 @@
 #define STRINGIFY_(x)  STRINGIFY__(x)
 #define STRINGIFY(x)   STRINGIFY_(x)
 
+bool ensure_impl(bool condition, const char *expr, const char *file, int line)
+{
+	if (!condition)
+	{
+		char message_buffer[512];
+		snprintf(message_buffer, sizeof(message_buffer), "ensure condition failed: '%s' at line %d in file %s\n", expr, line, file);
+
+		OutputDebugStringA(message_buffer);
+
+		__debugbreak();
+	}
+
+	return condition;
+}
+
+#define ALWAYS(x)  ensure_impl(x, #x, __FILE__, __LINE__)
+#define NEVER(x)  !ensure_impl(!(x), "!(" #x ")", __FILE__, __LINE__)
+
 uintptr_t AlignUp(uintptr_t address, uintptr_t align)
 {
 
     uintptr_t result = (address + (align-1)) & (-(intptr_t)align);
     return result;
 }
+
+template <typename T>
+T *AlignPointer(T *pointer, uintptr_t align)
+{
+	return (T *)AlignUp((uintptr_t)pointer, align);
+}
+
+//------------------------------------------------------------------------
+// Base
+
+struct LinearAllocator
+{
+	char *base;
+	char *at;
+	char *end;
+
+	void Init(size_t capacity)
+	{
+		base = new char[capacity];
+		at   = base;
+		end  = base + capacity;
+	}
+
+	void *Allocate(size_t size, size_t align)
+	{
+		char *result = AlignPointer(at, align);
+
+		if (NEVER(result + size > end))
+		{
+			return NULL;
+		}
+
+		at = result + size;
+		return result;
+	}
+
+	template <typename T>
+	T *AllocateTyped(size_t count = 1)
+	{
+		return (T *)Allocate(sizeof(T)*count, alignof(T));
+	}
+
+	void Reset()
+	{
+		at = base;
+	}
+};
+
+LinearAllocator frame_allocator;
 
 //------------------------------------------------------------------------
 // DXC
@@ -120,7 +187,7 @@ bool DXC_CompileShader(
 // D3D12
 
 static constexpr int  g_frame_latency = 3;
-static constexpr bool g_enable_gpu_based_validation = true;
+static constexpr bool g_enable_gpu_based_validation = false;
 
 //------------------------------------------------------------------------
 
@@ -135,7 +202,7 @@ enum D3D12_RootParameters
 
 //------------------------------------------------------------------------
 
-static void *D3D12_MapEntireBuffer(ID3D12Resource *resource)
+void *D3D12_MapEntireBuffer(ID3D12Resource *resource)
 {
 	D3D12_RANGE range = {};
 
@@ -198,32 +265,6 @@ ID3D12Resource *D3D12_CreateUploadBuffer(
 
 //------------------------------------------------------------------------
 
-bool D3D12_Transition(
-	ID3D12Resource         *resource,
-	D3D12_RESOURCE_STATES  *current_state,
-	D3D12_RESOURCE_STATES   desired_state,
-	D3D12_RESOURCE_BARRIER *barrier)
-{
-	bool result = false;
-
-	if (*current_state != desired_state)
-	{
-		barrier->Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		barrier->Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
-		barrier->Transition.pResource = resource;
-		barrier->Transition.Subresource = 0;
-		barrier->Transition.StateBefore = *current_state;
-		barrier->Transition.StateAfter  = desired_state;
-		*current_state = desired_state;
-
-		result = true;
-	}
-
-	return result;
-}
-
-//------------------------------------------------------------------------
-
 struct D3D12_BufferAllocation
 {
 	ID3D12Resource           *buffer;
@@ -244,13 +285,7 @@ struct D3D12_LinearAllocator
 	{
 		buffer = D3D12_CreateUploadBuffer(device, size, L"Frame Allocator");
 
-		void *mapped;
-
-		D3D12_RANGE null_range = {};
-		HRESULT hr = buffer->Map(0, &null_range, &mapped);
-		CHECK_HR(hr);
-
-		cpu_base = (char *)mapped;
+		cpu_base = (char *)D3D12_MapEntireBuffer(buffer);
 		gpu_base = buffer->GetGPUVirtualAddress();
 		at       = 0;
 		capacity = size;
@@ -310,6 +345,14 @@ struct D3D12_UploadContext
 	uint32_t                   offset;
 	void                      *pointer;
 	D3D12_UploadSubmission    *submission;
+
+	void CopyBufferRegion(ID3D12Resource *dst_buffer, uint64_t dst_offset, const void *src_pointer, uint64_t size)
+	{
+		// Copy to upload buffer
+		memcpy(pointer, src_pointer, size);
+		// And then from upload buffer to destination buffer
+		command_list->CopyBufferRegion(dst_buffer, dst_offset, buffer, offset, size);
+	}
 };
 
 struct D3D12_RingBufferAllocator
@@ -485,6 +528,32 @@ struct D3D12_RingBufferAllocator
 
 //------------------------------------------------------------------------
 
+bool D3D12_Transition(
+	ID3D12Resource         *resource,
+	D3D12_RESOURCE_STATES  *current_state,
+	D3D12_RESOURCE_STATES   desired_state,
+	D3D12_RESOURCE_BARRIER *barrier)
+{
+	bool result = false;
+
+	if (*current_state != desired_state)
+	{
+		barrier->Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		barrier->Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		barrier->Transition.pResource = resource;
+		barrier->Transition.Subresource = 0;
+		barrier->Transition.StateBefore = *current_state;
+		barrier->Transition.StateAfter  = desired_state;
+		*current_state = desired_state;
+
+		result = true;
+	}
+
+	return result;
+}
+
+//------------------------------------------------------------------------
+
 struct D3D12_Descriptor
 {
 	D3D12_CPU_DESCRIPTOR_HANDLE cpu;
@@ -575,12 +644,13 @@ struct D3D12_Frame
 
 struct D3D12_State
 {
-	IDXGIFactory6       *factory;
-	IDXGIAdapter1       *adapter;
-	ID3D12Device        *device;
-	ID3D12CommandQueue  *queue;
-	ID3D12Fence         *fence;
-	ID3D12RootSignature *rs_bindless;
+	IDXGIFactory6          *factory;
+	IDXGIAdapter1          *adapter;
+	ID3D12Device           *device;
+	ID3D12CommandQueue     *queue;
+	ID3D12Fence            *fence;
+	ID3D12RootSignature    *rs_bindless;
+	ID3D12CommandSignature *command_signature_indexed;
 
 	uint64_t frame_index;
 
@@ -878,9 +948,81 @@ void D3D12_Init(HWND window)
 	}
 
 	//------------------------------------------------------------------------
+	// Indirect Args Command Signature
+
+	{
+		D3D12_INDIRECT_ARGUMENT_DESC arg_desc = {
+			.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW_INDEXED,
+		};
+
+		D3D12_COMMAND_SIGNATURE_DESC desc = {
+			.ByteStride       = sizeof(D3D12_DRAW_INDEXED_ARGUMENTS),
+			.NumArgumentDescs = 1,
+			.pArgumentDescs   = &arg_desc,
+		};
+
+		hr = g_d3d.device->CreateCommandSignature(&desc, NULL, IID_PPV_ARGS(&g_d3d.command_signature_indexed));
+		CHECK_HR(hr);
+	}
+
+	//------------------------------------------------------------------------
 	// Disable Alt+Enter keybind
 
 	g_d3d.factory->MakeWindowAssociation(window, DXGI_MWA_NO_ALT_ENTER);
+}
+
+//------------------------------------------------------------------------
+// Default buffer creation
+
+ID3D12Resource *D3D12_CreateBuffer(
+	ID3D12Device   *device,
+	uint32_t        size,
+	const wchar_t  *debug_name,
+	const void     *initial_data      = NULL,
+	uint32_t        initial_data_size = 0)
+{
+	D3D12_HEAP_PROPERTIES heap_properties = {
+		.Type = D3D12_HEAP_TYPE_DEFAULT,
+	};
+
+	D3D12_RESOURCE_DESC desc = {
+		.Dimension        = D3D12_RESOURCE_DIMENSION_BUFFER,
+		.Width            = size,
+		.Height           = 1,
+		.DepthOrArraySize = 1,
+		.MipLevels        = 1,
+		.Format           = DXGI_FORMAT_UNKNOWN,
+		.SampleDesc       = { .Count = 1, .Quality = 0 },
+		.Layout           = D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+	};
+
+	ID3D12Resource *result;
+	HRESULT hr = device->CreateCommittedResource(
+		&heap_properties,
+		D3D12_HEAP_FLAG_NONE,
+		&desc,
+		D3D12_RESOURCE_STATE_COMMON,
+		NULL,
+		IID_PPV_ARGS(&result));
+
+	CHECK_HR(hr);
+
+	result->SetName(debug_name);
+
+	if (initial_data)
+	{
+		assert(initial_data_size <= size || !"Your initial data is too big for this buffer!");
+
+		D3D12_RingBufferAllocator *uploader = &g_d3d.upload_allocator;
+
+		D3D12_UploadContext upload_ctx = uploader->BeginUpload(initial_data_size, 256);
+		{
+			upload_ctx.CopyBufferRegion(result, 0, initial_data, initial_data_size);
+		}
+		uploader->EndUpload(upload_ctx);
+	}
+
+	return result;
 }
 
 //------------------------------------------------------------------------
@@ -1146,7 +1288,7 @@ void MainVS(
 
 	Vertex vertex = vbuffer.Load(in_vertex_index);
 
-	out_position = float4(vertex.position + root.offset, 0, 1);
+	out_position = float4(0.25*vertex.position + root.offset, 0, 1);
 	out_uv       = vertex.uv;
 	out_color    = vertex.color;
 }
@@ -1256,6 +1398,81 @@ struct TriangleGuy
 	uint32_t texture;
 };
 
+#define USE_INDIRECT_DRAW 0
+
+struct D3D12_DrawPacket
+{
+	uint32_t             args_index;
+	D3D12_RootConstants *constants;
+};
+
+struct D3D12_DrawPacket2
+{
+	uint32_t pso;                  // 4
+	uint32_t args_buffer;          // 8
+	uint32_t args_offset;          // 12
+	uint32_t index_buffer;         // 16
+	uint32_t view_parameters;      // 20
+	uint32_t pass_parameters;      // 24
+	uint32_t draw_parameters;      // 28
+	uint32_t draw_parameters_size; // 32 NOTE: actual range of values is small and divisible by sizeof(UINT) == 4
+};
+
+struct D3D12_DrawStream
+{
+	uint32_t                      indirect_args_capacity;
+	uint32_t                      indirect_args_count;
+	ID3D12Resource               *indirect_args_buffer;
+	D3D12_DRAW_INDEXED_ARGUMENTS *indirect_args;
+
+	uint32_t                      packet_capacity;
+	uint32_t                      packet_count;
+	D3D12_DrawPacket             *packets;
+
+	void Init(uint32_t capacity)
+	{
+		indirect_args_capacity = capacity;
+		indirect_args_count    = 0;
+#if USE_INDIRECT_DRAW
+		indirect_args_buffer   = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(D3D12_DRAW_INDEXED_ARGUMENTS)*indirect_args_capacity, L"Indirect Args");
+		indirect_args          = (D3D12_DRAW_INDEXED_ARGUMENTS *)D3D12_MapEntireBuffer(indirect_args_buffer);
+#else
+		indirect_args_buffer   = NULL;
+		indirect_args          = new D3D12_DRAW_INDEXED_ARGUMENTS[capacity];
+#endif
+
+		packet_capacity = capacity;
+		packet_count    = 0;
+		packets         = new D3D12_DrawPacket[capacity];
+	}
+
+	void Draw(uint32_t index_count, D3D12_RootConstants *constants = NULL)
+	{
+		assert(indirect_args_count < indirect_args_capacity);
+
+		uint32_t args_index = indirect_args_count++;
+
+		D3D12_DRAW_INDEXED_ARGUMENTS *args = &indirect_args[args_index];
+		args->IndexCountPerInstance = index_count;
+		args->InstanceCount         = 1;
+		args->StartIndexLocation    = 0;
+		args->BaseVertexLocation    = 0;
+		args->StartInstanceLocation = 0;
+
+		assert(packet_count < packet_capacity);
+
+		D3D12_DrawPacket *packet = &packets[packet_count++];
+		packet->args_index = args_index;
+		packet->constants  = constants;
+	}
+
+	void Reset()
+	{
+		indirect_args_count = 0;
+		packet_count        = 0;
+	}
+};
+
 struct D3D12_Scene
 {
 	bool initialized;
@@ -1273,7 +1490,9 @@ struct D3D12_Scene
 	uint32_t     triangle_guy_count;
 	TriangleGuy *triangle_guys;
 
-	uint32_t    texture_index_offset;
+	D3D12_DrawStream draw_stream;
+
+	uint32_t texture_index_offset;
 };
 
 void D3D12_InitScene(D3D12_Scene *scene)
@@ -1299,8 +1518,13 @@ void D3D12_InitScene(D3D12_Scene *scene)
 		{ { -triangle_width, -0.5f }, {  0.0f,  0.0f }, { 1, 1, 1, 1 } },
 	};
 
+#if 0
 	scene->ibuffer = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(indices),  L"Index Buffer",  indices,  sizeof(indices));
 	scene->vbuffer = D3D12_CreateUploadBuffer(g_d3d.device, sizeof(vertices), L"Vertex Buffer", vertices, sizeof(vertices));
+#else
+	scene->ibuffer = D3D12_CreateBuffer(g_d3d.device, sizeof(indices),  L"Index Buffer",  indices,  sizeof(indices));
+	scene->vbuffer = D3D12_CreateBuffer(g_d3d.device, sizeof(vertices), L"Vertex Buffer", vertices, sizeof(vertices));
+#endif
 
 	scene->vbuffer_srv = g_d3d.cbv_srv_uav.Allocate();
 
@@ -1359,13 +1583,18 @@ void D3D12_InitScene(D3D12_Scene *scene)
 	//------------------------------------------------------------------------
 	// Initialize triangle guys
 
-	scene->triangle_guy_count = 1024;
+	scene->triangle_guy_count = 8*8192;
 	scene->triangle_guys      = new TriangleGuy[scene->triangle_guy_count]{};
 
 	for (size_t i = 0; i < scene->triangle_guy_count; i++)
 	{
 		scene->triangle_guys[i].texture = (uint32_t)(i % 4);
 	}
+
+	//------------------------------------------------------------------------
+	// Init draw stream
+
+	scene->draw_stream.Init(scene->triangle_guy_count);
 
 	//------------------------------------------------------------------------
 
@@ -1378,8 +1607,8 @@ void D3D12_UpdateScene(D3D12_Scene *scene, double current_time)
 	{
 		TriangleGuy *guy = &scene->triangle_guys[i];
 		
-		guy->position.x = (float)(0.5 * sin(0.6 * (double)i + 1.25*current_time));
-		guy->position.y = (float)(0.3 * sin(0.4 * (double)i + 0.65*current_time));
+		guy->position.x = (float)(0.8*sin(0.6*(double)i + 1.25*current_time));
+		guy->position.y = (float)(0.6*sin(0.4*(double)i + 0.65*current_time));
 	}
 }
 
@@ -1461,29 +1690,55 @@ void D3D12_Render(D3D12_Scene *scene)
 	list->SetGraphicsRootConstantBufferView(D3D12_RootParameter_pass_cbv, pass_alloc.gpu_base);
 
 	//------------------------------------------------------------------------
-	// Draw
+	// Record draw stream
+
+	D3D12_DrawStream *stream = &scene->draw_stream;
+	stream->Reset();
 
 	for (size_t i = 0; i < scene->triangle_guy_count; i++)
 	{
 		TriangleGuy *guy = &scene->triangle_guys[i];
 
+		uint32_t texture_index = (guy->texture + scene->texture_index_offset) % 4;
+
+		D3D12_RootConstants *root_constants = frame_allocator.AllocateTyped<D3D12_RootConstants>();
+		root_constants->offset        = guy->position;
+		root_constants->texture_index = scene->textures_srvs[texture_index].index;
+
+		stream->Draw(3, root_constants);
+	}
+
+	//------------------------------------------------------------------------
+	// Draw
+
+	for (size_t i = 0; i < stream->packet_count; i++)
+	{
+		D3D12_DrawPacket *packet = &stream->packets[i];
+
 		//------------------------------------------------------------------------
 		// Set root constants
 
-		uint32_t texture_index = (guy->texture + scene->texture_index_offset) % 4;
-
-		D3D12_RootConstants root_constants = {
-			.offset        = guy->position,
-			.texture_index = scene->textures_srvs[texture_index].index,
-		};
-
-		uint32_t uint_count = sizeof(root_constants) / sizeof(uint32_t);
-		list->SetGraphicsRoot32BitConstants(D3D12_RootParameter_32bit_constants, uint_count, &root_constants, 0);
+		if (packet->constants)
+		{
+			uint32_t uint_count = sizeof(*packet->constants) / sizeof(uint32_t);
+			list->SetGraphicsRoot32BitConstants(D3D12_RootParameter_32bit_constants, uint_count, packet->constants, 0);
+		}
 
 		//------------------------------------------------------------------------
-		// Draw the triangle
+		// Execute
 
-		list->DrawIndexedInstanced(3, 1, 0, 0, 0);
+#if USE_INDIRECT_DRAW
+		uint64_t byte_offset = packet->args_index*sizeof(D3D12_DRAW_INDEXED_ARGUMENTS);
+		list->ExecuteIndirect(g_d3d.command_signature_indexed, 1, stream->indirect_args_buffer, byte_offset, NULL, 0);
+#else
+		D3D12_DRAW_INDEXED_ARGUMENTS *args = &stream->indirect_args[packet->args_index];
+		list->DrawIndexedInstanced(
+			args->IndexCountPerInstance,
+			args->InstanceCount,
+			args->StartIndexLocation,
+			args->BaseVertexLocation,
+			args->StartInstanceLocation);
+#endif
 	}
 }
 
@@ -1601,6 +1856,8 @@ D3D12_Scene g_scene;
 
 int main(int, char **)
 {
+	frame_allocator.Init(MiB(8));
+
 	HWND window = Win32_CreateWindow();
 	
 	SetWindowLongPtrW(window, GWLP_USERDATA, (LONG_PTR)&g_scene);
@@ -1617,6 +1874,8 @@ int main(int, char **)
 
 	while (running)
 	{
+		frame_allocator.Reset();
+
 		MSG msg;
 		while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE))
 		{
